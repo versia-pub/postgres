@@ -15,7 +15,7 @@ RUN cd "$(mktemp -d)" \
         && cp "$PG_MAJOR/pg_uuidv7.so" "$(pg_config --pkglibdir)" \
         && cp sql/pg_uuidv7--1.3.sql pg_uuidv7.control "$(pg_config --sharedir)/extension"
 # Add a script to run the CREATE EXTENSION command
-RUN echo '#!/bin/sh\npsql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION pg_uuidv7;"' > /docker-entrypoint-initdb.d/init.sh
+RUN printf '#!/bin/sh\npsql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION pg_uuidv7;"' > /docker-entrypoint-initdb.d/init.sh
 
 # Make the entrypoint script executable
 RUN chmod +x /docker-entrypoint-initdb.d/init.sh
