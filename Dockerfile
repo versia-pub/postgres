@@ -19,3 +19,4 @@ RUN printf '#!/bin/sh\npsql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXT
 
 # Make the entrypoint script executable
 RUN chmod +x /docker-entrypoint-initdb.d/init.sh
+CMD ["postgres"]
