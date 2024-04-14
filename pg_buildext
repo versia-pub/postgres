@@ -1,0 +1,465 @@
+#!/bin/sh
+#
+# build a PostgreSQL module based on PGXS for given list of supported major
+# versions
+#
+# (C) 2010 Dimitri Fontaine <dfontaine@hi-media.com>
+# (C) 2011-2022 Christoph Berg <myon@debian.org>
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+
+set -eu
+
+die() {
+    echo "$(basename $0): error: $*" >&2
+    exit 1
+}
+
+VENVARGS=""
+MAKEVARS=""
+while getopts "c:i:m:o:s" opt ; do
+    case $opt in
+	c|i|o) VENVARGS="$VENVARGS -$opt $OPTARG" ;;
+	m) MAKEVARS="$OPTARG" ;;
+	s) VENVARGS="$VENVARGS -$opt" ;;
+	*) exit 1 ;;
+    esac
+done
+# shift away args
+shift $(($OPTIND - 1))
+
+# positional arguments: action [srcdir] [target [opt]]
+[ "${1:-}" ] || die "no action given"
+action="$1"
+if [ -d "${2:-}" ] && [ "${3:-}" ]; then # optional: $2 is source directory
+    srcdir="${2:-}"
+    [ "$srcdir" = "." ] && srcdir="$PWD"
+    shift
+else
+    srcdir="$PWD"
+fi
+target="${2:-}"
+opt="${3:-}"
+
+prepare_env() {
+    local version=$1
+    vtarget=`echo $target | sed -e "s:%v:$version:g"`
+    pgc="/usr/local/bin/pg_config"
+    [ -e "$pgc" ] || die "$pgc does not exist"
+    if [ "${CFLAGS:-}" ]; then
+        export COPT="$CFLAGS"
+    fi
+}
+
+configure() {
+    prepare_env $1
+    confopts=`echo $opt | sed -e "s:%v:$1:g"`
+
+    mkdir -p $vtarget
+    ( echo "calling configure in $vtarget" &&
+      cd $vtarget && $srcdir/configure $confopts PG_CONFIG="$pgc" VPATH="$srcdir" ) || return $?
+}
+
+build() {
+    prepare_env $1
+    if [ "$opt" ]; then
+        cflags="$(echo $opt | sed -e "s:%v:$1:g")"
+        export COPT="${COPT:+$COPT }$cflags"
+    fi
+
+    mkdir -p $vtarget
+    # if a Makefile was created by configure, use it, else the top level Makefile
+    [ -f $vtarget/Makefile ] || makefile="-f $srcdir/Makefile"
+    make -C $vtarget ${makefile:-} PG_CONFIG="$pgc" VPATH="$srcdir" USE_PGXS=1 $MAKEVARS || return $?
+}
+
+substvars() {
+    version="$1"
+    package="$2"
+
+    depends="postgresql-$version"
+    if [ -d "debian/$package/usr/lib/postgresql/$version/lib/bitcode" ]; then
+        pg_provides=$(dpkg-query --show --showformat='${Provides}' postgresql-$version | grep -o 'postgresql-[0-9]*-jit-llvm (= [0-9.]*')
+        llvm_version=${pg_provides#*= }
+        if [ "$llvm_version" ]; then # skip if server version doesn't have the Provides yet
+            depends="$depends, postgresql-$version-jit-llvm (>= $llvm_version)"
+        fi
+    fi
+    echo "postgresql:Depends=$depends" >> "debian/$package.substvars"
+
+    if ! grep -q postgresql:Depends debian/control; then # compat: add to misc:Depends
+        if grep -q ^misc:Depends "debian/$package.substvars"; then
+            sed -i -e "s/^misc:Depends=/misc:Depends=$depends, /" "debian/$package.substvars"
+        else
+            echo "misc:Depends=$depends" >> "debian/$package.substvars"
+        fi
+    fi
+}
+
+install() {
+    prepare_env $1
+    package=`echo $opt | sed -e "s:%v:$1:g"`
+
+    mkdir -p $vtarget
+    # if a Makefile was created by configure, use it, else the top level Makefile
+    [ -f $vtarget/Makefile ] || makefile="-f $srcdir/Makefile"
+    make -C $vtarget ${makefile:-} install DESTDIR="$PWD/debian/$package" PG_CONFIG="$pgc" VPATH="$srcdir" USE_PGXS=1 $MAKEVARS || return $?
+    substvars "$1" "$package"
+}
+
+clean() {
+    prepare_env $1
+    if [ "$vtarget" ]; then
+        rm -rf $vtarget
+    fi
+}
+
+loop() {
+    prepare_env $1
+    package=$(echo $target | sed -e "s:%v:$1:g")
+
+    echo "# $1: make"
+    make -C "$srcdir"         PG_CONFIG="$pgc" USE_PGXS=1 $MAKEVARS || return $?
+    echo "# $1: make install"
+    make -C "$srcdir" install DESTDIR="$PWD/debian/$package" PG_CONFIG="$pgc" USE_PGXS=1 $MAKEVARS || return $?
+    substvars "$1" "$package"
+    echo "# $1: make clean"
+    make -C "$srcdir" clean   PG_CONFIG="$pgc" USE_PGXS=1 $MAKEVARS # clean errors are fatal
+}
+
+installcheck() {
+    prepare_env $1
+
+    # ask pg_regress to output unified diffs
+    export PG_REGRESS_DIFF_OPTS="-U3"
+
+    # ask pg_virtualenv to create a non-system cluster
+    if [ "${NONROOT-unset}" = "unset" ]; then
+        export NONROOT=1
+    fi
+
+    # if a package pattern is given, tell pg_virtualenv where the installed files are
+    if [ "$opt" ]; then
+        pkg=$(echo "$opt" | sed -e "s:%v:$1:g")
+        PKGARGS="-p $pkg"
+        DESTDIR="DESTDIR=$PWD/debian/$pkg"
+    fi
+
+    if [ "$target" ] && [ "$target" != "." ]; then # if target is given, use it, else stay in the top source dir
+	# if a Makefile was created by configure, use it, else the top level Makefile
+	[ -f $vtarget/Makefile ] || makefile="-f $srcdir/Makefile"
+        if ! pg_virtualenv ${PKGARGS:-} $VENVARGS -v $1 \
+	    make -C $vtarget ${makefile:-} installcheck ${DESTDIR:-} \
+		PG_CONFIG="$pgc" VPATH="$srcdir" USE_PGXS=1 $MAKEVARS; then
+	    if [ -r $vtarget/regression.diffs ]; then
+		echo "**** $vtarget/regression.diffs ****"
+		cat $vtarget/regression.diffs
+	    fi
+	    return 1
+	fi
+    else
+        if ! pg_virtualenv ${PKGARGS:-} $VENVARGS -v $1 \
+	    make installcheck ${DESTDIR:-} PG_CONFIG="$pgc" USE_PGXS=1 $MAKEVARS; then
+	    if [ -r regression.diffs ]; then
+		echo "**** regression.diffs ****"
+		cat regression.diffs
+	    fi
+	    return 1
+	fi
+        # since we are in the top-level directory, clean up behind us
+        make clean PG_CONFIG="$pgc" USE_PGXS=1 $MAKEVARS
+    fi
+}
+
+run_psql () {
+    prepare_env $1
+
+    # ask pg_virtualenv to create a non-system cluster
+    if [ "${NONROOT-unset}" = "unset" ]; then
+        export NONROOT=1
+    fi
+
+    # if a package pattern is given, tell pg_virtualenv where the installed files are
+    if [ "$opt" ]; then
+        pkg=$(echo "$opt" | sed -e "s:%v:$1:g")
+        PKGARGS="-p $pkg"
+        export DESTDIR="$PWD/debian/$pkg"
+    fi
+
+    (
+        if [ "$target" ] && [ "$target" != "." ]; then # if target is given, use it, else stay in the top source dir
+            cd $target
+        fi
+        pg_virtualenv ${PKGARGS:-} $VENVARGS -v $1 \
+            psql -Xe -v ON_ERROR_STOP=1 < $PSQLTMP
+    ) || return $?
+}
+
+run_virtualenv () {
+    prepare_env $1
+
+    # ask pg_virtualenv to create a non-system cluster
+    if [ "${NONROOT-unset}" = "unset" ]; then
+        export NONROOT=1
+    fi
+
+    # if a package pattern is given, tell pg_virtualenv where the installed files are
+    if [ "$opt" ]; then
+        pkg=$(echo "$opt" | sed -e "s:%v:$1:g")
+        PKGARGS="-p $pkg"
+        export DESTDIR="$PWD/debian/$pkg"
+    fi
+
+    (
+        if [ "$target" ] && [ "$target" != "." ]; then # if target is given, use it, else stay in the top source dir
+            cd $target
+        fi
+        pg_virtualenv ${PKGARGS:-} $VENVARGS -v $1 ${SHELL:-/bin/sh} -ex < $PSQLTMP
+    ) || return $?
+}
+
+versions() {
+    [ -e /usr/share/postgresql-common/supported-versions ] ||
+	die "/usr/share/postgresql-common/supported-versions not found"
+    [ -e debian/pgversions ] || die "debian/pgversions not found"
+    supported_versions=$(/usr/share/postgresql-common/supported-versions)
+    local version
+    while read version; do
+	case $version in
+	    all) echo "$supported_versions" ;;
+	    [1-9]*+)
+		for sup_version in $supported_versions; do
+                    if dpkg --compare-versions "${version%+}" le "$sup_version"; then echo "$sup_version"; fi
+		done ;;
+	    [1-9]*)
+		for sup_version in $supported_versions; do
+		    if [ "$version" = "$sup_version" ]; then echo "$sup_version"; fi
+		done ;;
+	    '#'*) ;;
+	    '') ;;
+	    *) echo "Syntax error in debian/pgversions: $version" >&2 ;;
+	esac
+    done < debian/pgversions
+}
+
+# list of PostgreSQL versions for which packages built from this source are installed
+# (not necessarily the same as listed in debian/control)
+installed_versions() {
+    [ -e debian/control.in ] || die "debian/control.in not found"
+    # extract package name template(s) from control.in, split into prefix and suffix
+    perl -lne 'print "$1 $2" if /^Package: (.*)PGVERSION(.*)/' debian/control.in | \
+        while read prefix suffix; do
+            # translate templates to actually installed packages, and extract version numbers
+            dpkg-query --showformat '${db:Status-Status} ${Package}\n' --show "$prefix*$suffix" | \
+                grep '^installed' | cut -d ' ' -f 2 | sed -e "s/^$prefix//; s/$suffix\$//" | egrep '^[0-9.]+$'
+            # if suffix is empty, the egrep will filter out noise like '13-dbgsym'
+        done | sort -uV
+}
+
+gencontrol() {
+    tmpcontrol=$(mktemp debian/control.XXXXXX)
+    if [ -f debian/tests/control.in ]; then
+        tmptestscontrol=$(mktemp debian/tests/control.XXXXXX)
+    fi
+    trap "rm -f $tmpcontrol ${tmptestscontrol:-}" EXIT
+
+    export PGVERSIONS="$(versions)"
+    [ "$PGVERSIONS" ] || die "No current PostgreSQL versions are supported by this package"
+
+    perl -e \
+        '$/ = ""; # read paragraphs
+        while (<>) {
+            chomp;
+            if (/PGVERSION/) {
+                foreach my $version (split /\n/, $ENV{PGVERSIONS}) {
+                    push @out, s/PGVERSION/$version/rg;
+                }
+            } else {
+                push @out, $_;
+            }
+        }
+        print join("\n\n", @out), "\n";
+        ' debian/control.in > $tmpcontrol
+
+    if [ -f debian/tests/control.in ]; then
+        cp debian/tests/control.in $tmptestscontrol
+        # find words (package names) containing PGVERSION
+        REGEXP='[[:alnum:]-]*PGVERSION[[:alnum:]-]*'
+        for pkgpattern in $(egrep -wo "$REGEXP" debian/tests/control.in | sort -u); do
+            repl=""
+            # build an array of replacements separated by ,
+            for v in $(versions); do
+                repl="${repl:+$repl, }$(echo $pkgpattern | sed -e "s/PGVERSION/$v/g")"
+            done
+            # put array into control file
+            grep -q "$pkgpattern" $tmptestscontrol # assert the pattern didn't get already removed by an earlier replacement
+            sed -i -e "s/$pkgpattern/$repl/" $tmptestscontrol
+        done
+    fi
+}
+
+updatecontrol() {
+    cat $tmpcontrol > debian/control
+
+    if [ -f debian/tests/control.in ]; then
+        cat $tmptestscontrol > debian/tests/control
+    fi
+}
+
+# when a version is included in the action, just act on this one (this is
+# useful if some extra work needs to be done per version, so the loop over
+# supported-versions needs to be in the script calling pg_buildext)
+
+case $action in
+    configure-*|build-*|install-*|clean-*|installcheck-*)
+	a=${action%%-*}
+	v=${action##$a-}
+        ret=0
+        echo "### PostgreSQL $v $a ###"
+        if $a $v; then
+            echo "### End $v $a ###"
+        else
+            ret=$?
+            echo "### End $v $a (FAILED with exit code $ret) ###"
+        fi
+        exit $ret
+	;;
+
+    checkcontrol)
+        [ -f debian/control.in ] || exit 0 # silently exit if debian/control.in is not there
+        gencontrol
+        need_update=
+        if ! diff -u debian/control $tmpcontrol; then
+            if [ "${PG_UPDATECONTROL:-no}" != "no" ] || head -1 debian/changelog | egrep -q -- '-backports|-pgdg|-pgapt'; then
+                echo "Notice: Updating debian/control from debian/control.in."
+                need_update=1
+            else
+                echo "Error: debian/control needs updating from debian/control.in. Run 'pg_buildext updatecontrol'."
+                echo "If you are seeing this message in a buildd log, a sourceful upload is required."
+                exit 1
+            fi
+        fi
+        if [ -f debian/tests/control.in ] && ! diff -u debian/tests/control $tmptestscontrol; then
+            echo "Notice: Updating debian/tests/control from debian/tests/control.in."
+            need_update=1
+        fi
+        [ "$need_update" ] && updatecontrol
+        exit 0
+        ;;
+
+    updatecontrol)
+        [ -f debian/control.in ] || die "debian/control.in is missing, cannot update debian/control"
+        gencontrol
+        updatecontrol
+        exit
+        ;;
+
+    clean)
+        if [ "$target" ]; then
+            pattern=$(echo "$target" | sed -e "s:%v:*:g")
+            echo rm -rf $pattern/
+            rm -rf $pattern/
+        fi
+        if [ "$opt" ]; then
+            pattern=$(echo "$opt" | sed -e "s:%v:*:g")
+            echo rm -rf debian/$pattern/ debian/$pattern.substvars
+            rm -rf debian/$pattern/ debian/$pattern.substvars
+        fi
+        if [ -f Makefile ]; then
+            make clean USE_PGXS=1
+        fi
+        exit
+        ;;
+
+    installed-versions)
+        installed_versions
+        exit
+        ;;
+
+    installcheck)
+        # prefer testing installed versions over supported versions as the set
+        # of versions might have changed (unless a package-pattern is provided)
+        if [ -f debian/control.in ] && [ -z "$opt" ]; then
+            versions=$(installed_versions)
+        else
+            versions=$(versions)
+        fi
+        [ "$versions" ] || exit 1
+        ret=0
+        for v in $versions; do
+            echo "### PostgreSQL $v $action ###"
+            if $action $v; then
+                echo "### End $v $action ###"
+            else
+                ret=$?
+                echo "### End $v $action (FAILED with exit code $ret) ###"
+            fi
+        done
+        exit $ret
+        ;;
+
+    psql|virtualenv)
+        PSQLTMP=$(mktemp --tmpdir psql.XXXXXX)
+        trap "rm -f $PSQLTMP" EXIT
+        # if we are fed any input (and hence aren't reading from a terminal),
+        # store it in a tempfile
+        [ ! -t 0 ] && cat > $PSQLTMP
+
+        # prefer testing installed versions over supported versions as the set
+        # of versions might have changed (unless a package-pattern is provided)
+        if [ -f debian/control.in ] && [ -z "$opt" ]; then
+            versions=$(installed_versions)
+        else
+            versions=$(versions)
+        fi
+        [ "$versions" ] || exit 1
+        ret=0
+        for v in $versions; do
+            echo "### PostgreSQL $v $action ###"
+            if run_$action $v; then
+                echo "### End $v $action ###"
+            else
+                ret=$?
+                echo "### End $v $action (FAILED with exit code $ret) ###"
+            fi
+        done
+        exit $ret
+        ;;
+esac
+
+# loop over versions
+
+ret=0
+for v in $(versions)
+do
+    case "$action" in
+	"supported-versions")
+	    echo $v
+	    ;;
+
+	configure|build|install|clean|loop)
+	    [ "$target" ] || die "syntax: pg_buildext $action <target> [<srcdir>] [<opt>]"
+            echo "### PostgreSQL $v $action ###"
+            if $action $v; then
+                echo "### End $v $action ###"
+            else
+                ret=$?
+                echo "### End $v $action (FAILED with exit code $ret) ###"
+            fi
+	    ;;
+
+	*)
+	    die "unsupported action '$action'"
+	    ;;
+    esac
+done
+
+exit $ret
